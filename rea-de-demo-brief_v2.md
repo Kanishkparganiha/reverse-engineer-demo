@@ -219,6 +219,167 @@ Record **Option B first** as a guaranteed anchor, then **Option A** for the "wow
 
 ---
 
+## 4b. ADDENDUM — what we actually had to do (rea-agents 6.7.0, Oct 2026)
+
+> This section documents the **real** procedure used in this repo, which diverges from §4 above.
+> Keep §4 as the aspirational/future narrative; use this section as the literal runbook.
+
+### Why this detour exists
+
+Tested directly against the installed `rea-agents@6.7.0` CLI: its JADX-backed provider is
+**Android-APK-only**. Pointing `rea analyze` / `rea inspect-android-package` straight at
+`customer-cleanse.jar` fails:
+
+```
+$ rea inspect-android-package customer-cleanse.jar
+reason: Target .../customer-cleanse.jar is zip; provide one standalone APK.
+```
+
+`rea analyze`/`decompile`'s generic providers (Ghidra, Hopper, IDA, Kuna) are all **native-binary**
+analyzers and explicitly reject archive targets too. There is currently no "decompile a plain JVM
+jar" command in rea — only `inspect-android-package`, `inspect-android-class`,
+`inspect-android-method`, `search-android-classes`, `trace-android-references`, all of which require
+a **standalone Android APK**.
+
+Sanity check: raw `jadx` (the Homebrew CLI, not rea) decompiles the plain jar perfectly — so the
+decompiler itself is not the limitation; it's specifically rea's current CLI/MCP wrapper around it.
+
+### Extra prerequisites beyond §1
+
+- **Android SDK build tools** (to repackage the plain jar as a minimal, validly-signed APK):
+  ```bash
+  brew install --cask android-commandlinetools
+  export ANDROID_HOME=/opt/homebrew/share/android-commandlinetools
+  yes | sdkmanager --licenses
+  sdkmanager "build-tools;35.0.0" "platforms;android-34"
+  ```
+  Gives you `d8` (dex compiler), `aapt2` (manifest compiler/linker), `apksigner`, `zipalign`.
+
+- **The rea JADX provider's own engine**: a pinned `jadx-headless-mcp` build, **not** the plain
+  `jadx` CLI. rea does not bundle or download this — same "caller-supplied" policy as its Ghidra/
+  Hopper/IDA/Kuna providers.
+  ```bash
+  mkdir -p <somewhere-visible>/rea-tools
+  curl -L -o <somewhere-visible>/rea-tools/jadx-headless-mcp-0.7.1-all.jar \
+    https://github.com/1013503897/jadx-headless-mcp/releases/download/v0.7.1/jadx-headless-mcp-0.7.1-all.jar
+  shasum -a 256 <somewhere-visible>/rea-tools/jadx-headless-mcp-0.7.1-all.jar
+  # must equal: 6e5eacf500b64292bfb73c49797c1958f6ee44646e43e868039ae7feb573ff75
+  ```
+  This is a third-party individual's GitHub repo, not an Anthropic/rea-published artifact — verify
+  the checksum before trusting it, and get a human's explicit sign-off before downloading/running
+  it (this is exactly the kind of step an auto-mode safety classifier should, and did, block from
+  running unattended).
+
+  Then persist it and re-register:
+  ```bash
+  echo 'export REA_JADX_MCP_JAR="<path-to-the-jar>"' >> ~/.zshrc
+  source ~/.zshrc
+  npx rea-agents setup --client claude_code -y   # re-registers with the env var picked up
+  ```
+  Confirm with `rea doctor` — the `jadx` check should flip to `ok: true, classification: healthy`.
+
+### Repackaging the jar as a minimal APK
+
+The APK only needs to be *structurally valid* enough for rea/JADX to load it — it is never
+installed or executed.
+
+```bash
+BT=$ANDROID_HOME/build-tools/35.0.0
+PLATFORM_JAR=$ANDROID_HOME/platforms/android-34/android.jar
+
+# 1. dex the compiled Scala classes (the artifact's real logic)
+"$BT/d8" --output build/apk/dex original/build/CleanseJob.class "original/build/CleanseJob\$.class"
+
+# 2. minimal manifest (no resources, no activities — just needs a package name + hasCode)
+cat > build/apk/manifest/AndroidManifest.xml <<'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.reademo.cleansejob" android:versionCode="1" android:versionName="1.0">
+    <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34" />
+    <application android:label="CleanseJob" android:hasCode="true" />
+</manifest>
+EOF
+
+# 3. compile the manifest + link into a base APK (no resources to compile, so no `aapt2 compile` step)
+"$BT/aapt2" link -o build/apk/out/base.apk \
+  --manifest build/apk/manifest/AndroidManifest.xml -I "$PLATFORM_JAR"
+
+# 4. bundle classes.dex into it
+cp build/apk/out/base.apk build/apk/out/unsigned.apk
+jar uf build/apk/out/unsigned.apk -C build/apk/dex classes.dex
+
+# 5. sign with a throwaway debug keystore (rea's "standalone APK" check needs a real signature)
+keytool -genkeypair -v -keystore build/apk/debug.keystore -storepass android \
+  -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+  -dname "CN=rea-demo,O=rea-demo,C=US"
+"$BT/apksigner" sign --ks build/apk/debug.keystore --ks-pass pass:android --key-pass pass:android \
+  --out rea-input/customer-cleanse.apk build/apk/out/unsigned.apk
+"$BT/apksigner" verify rea-input/customer-cleanse.apk   # exit 0 = valid
+```
+
+### The actual rea commands that recovered the logic
+
+```bash
+export REA_JADX_MCP_JAR="<path-to-the-jar>"
+
+# confirms rea can load it at all
+rea inspect-android-package rea-input/customer-cleanse.apk
+
+# enumerate classes inside — our logic lives in the Scala "object" companion class
+rea search-android-classes rea-input/customer-cleanse.apk ""
+#   -> defpackage.CleanseJob, defpackage.CleanseJob$, ...ExternalSyntheticLambda0-2, defpackage.R
+
+# list members of the class that holds the real logic
+rea inspect-android-class rea-input/customer-cleanse.apk "defpackage.CleanseJob\$"
+#   -> methods: transformRow, main, REGION_MAP, <clinit>, ...
+
+# decompile the method that implements all 6 rules
+rea inspect-android-method rea-input/customer-cleanse.apk "defpackage.CleanseJob\$" transformRow --overload-index 0
+
+# decompile <clinit> to recover the literal REGION_MAP constant values
+rea inspect-android-method rea-input/customer-cleanse.apk "defpackage.CleanseJob\$" "<clinit>" --overload-index 0
+```
+
+**What came back** (verbatim, via the real `rea-jadx-bridge`, provider `jadx 0.7.1`):
+
+`transformRow` decompiled to readable Java showing, in order: the `customerId == null ||
+isEmpty()` drop, the `status.equals("ACTIVE")` filter, the `signupDate.split("/")` → ISO rebuild,
+a call to `REGION_MAP().getOrElse(regionCode, "UNKNOWN")`, and the final `new String[]{customerId,
+name, isoDate, region}` — i.e. all 6 rules, with rule 6 (dropped `status`) visible by its *absence*
+from that output array.
+
+`<clinit>` fell back to smali (raw bytecode) rather than Java, but still legibly showed the literal
+constant construction: `const-string "1"` → `"NA"`, `"2"` → `"EU"`, `"3"` → `"APAC"` — recovering
+`REGION_MAP`'s exact contents straight from the bytecode.
+
+### Folder layout actually used (see repo root)
+
+```
+original/        # Part I — input.csv, output.csv, customer-cleanse.jar, src/CleanseJob.scala, build/
+rea-input/       # only what rea sees: customer-cleanse.jar, customer-cleanse.apk, output.csv (+ build/ = apk packaging intermediates)
+reconstruction/  # the reverse step: src/ReverseCleanse.scala, build/, reverse.jar, reconstructed.csv
+.tools/          # bundled Scala 2.13.16 toolchain (hidden, shared by original/ and reconstruction/ builds)
+```
+
+### Round-trip result on the REAL 100-row dataset (not the brief's 4-row toy sample)
+
+| Metric | Value |
+|---|---|
+| Original rows with non-empty `customer_id` and `status == ACTIVE` | 44 |
+| Reconstructed rows | 44 |
+| Fully exact reconstruction (id, status, date, name, region) | 26 |
+| Exact except region (see below) | 18 |
+| Real mismatches | **0** |
+
+**Extra honesty point, richer than the brief's toy example:** the real `input.csv` uses
+`region_code` values 1–5, but `REGION_MAP` only defines 1/2/3 — codes 4 and 5 **both** collapse to
+`"UNKNOWN"` going forward. So for 18 survivor rows, the reverse transform correctly cannot tell
+whether the original code was 4 or 5, and emits `"?"` rather than guessing. This is the same
+"logic, not data" boundary as the brief's dropped-row example, just surfacing inside a *reversible*
+column instead of only at the row level.
+
+---
+
 ## 5. Build the REVERSE transform from rea's recovered logic
 
 Using ONLY rea's recovered spec (not your original source), write the inverse. Run it on
