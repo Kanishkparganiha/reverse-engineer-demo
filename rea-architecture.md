@@ -2,48 +2,7 @@
 
 ## 1. Layers
 
-```mermaid
-flowchart TB
-    subgraph USERS["Who asks"]
-        HUMAN["👤 Analyst terminal"]
-        AGENT["🤖 AI agent Claude Code · Qwen Code · LangGraph"]
-    end
-
-    subgraph ENTRY["Entry points"]
-        CLI["CLI  rea &lt;command&gt;</code> one-shot"]
-        MCP["MCP server  rea mcp</code> long-lived sessions"]
-    end
-
-    CONTRACTS["Tool contracts one definition per tool: inputs · outputs · side effects"]
-
-    subgraph APP["Shared workflows"]
-        ROUTER["Provider selection deterministic, no silent fallback"]
-        SESSION["Sessions & snapshots reuse opened targets"]
-        LEDGER["Evidence & unknowns provenance ledger"]
-    end
-
-    subgraph ENGINES["Analysis engines (providers)"]
-        BUILTIN["Built-in SQLite · plist · Mach-O WASM · JavaScript · pcap · .NET"]
-        BYO["Bring your own Ghidra · IDA · Hopper · rizin JADX · JEB · Frida · gdb · adb"]
-    end
-
-    TARGET[("Target artifact binary · app · package · database")]
-
-    EVIDENCE[/"📄 Evidence record SHA-256 · provider version · parameters results · limitations observed / inferred / unknown"/]
-
-    HUMAN --> CLI
-    AGENT --> MCP
-    CLI --> CONTRACTS
-    MCP --> CONTRACTS
-    CONTRACTS --> APP
-    ROUTER --> ENGINES
-    SESSION --> ENGINES
-    ENGINES -->|"read-only copy bounded worker"| TARGET
-    ENGINES --> LEDGER
-    LEDGER --> EVIDENCE
-    EVIDENCE -.-> HUMAN
-    EVIDENCE -.-> AGENT
-```
+!(./rea_demo/HighLevelDiagram.png)
 
 ## 2. One request, end to end
 
