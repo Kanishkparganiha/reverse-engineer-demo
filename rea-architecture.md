@@ -2,7 +2,7 @@
 
 ## 1. Layers
 
-![High Level Diagram](rea_demo/HighLevelDiagram.png)
+![High Level Diagram](HighLevelDiagram.png)
 
 
 ## 2. One request, end to end
